@@ -1,0 +1,16 @@
+{
+    "name": "avik/crate",
+    "description": "Dependency injection container for the Avik framework",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Avik\\Crate\\": "src/"
+        }
+    },
+    "require": {
+        "php": ">=8.1",
+        "avik/seed": "^1.0"
+    },
+    "minimum-stability": "stable"
+}
