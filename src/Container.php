@@ -19,39 +19,36 @@ use Avik\Crate\Exceptions\{
 
 final class Container implements ContainerContract, ArrayAccess
 {
-    /**
-     * The current globally available container (if any).
-     */
-    protected static ?Container $instance = null;
+    protected static ?self $instance = null;
 
-    protected array $bindings        = [];
-    protected array $singletons      = [];
-    protected array $instances       = [];
-    protected array $aliases         = [];
-    protected array $resolving       = [];
-    protected array $tags            = [];
-    protected array $contextual      = [];
-    protected array $extenders       = [];
+    protected array $bindings = [];
+    protected array $singletons = [];
+    protected array $instances = [];
+    protected array $aliases = [];
+    protected array $tags = [];
+    protected array $contextual = [];
+    protected array $extenders = [];
     protected array $reflectionCache = [];
 
-    protected array $resolvingCallbacks      = [];
+    protected array $resolvingCallbacks = [];
     protected array $afterResolvingCallbacks = [];
 
-    /**
-     * Set the globally available instance of the container.
-     */
-    public static function setInstance(?Container $container = null): ?Container
+    // Stack to detect circular dependencies
+    protected array $resolving = [];
+
+    /* =========================
+       GLOBAL INSTANCE
+       ========================= */
+
+    public static function setInstance(?self $container = null): ?self
     {
         return static::$instance = $container;
     }
 
-    /**
-     * Get the globally available instance of the container.
-     */
-    public static function getInstance(): static
+    public static function getInstance(): self
     {
         if (is_null(static::$instance)) {
-            static::$instance = new static;
+            static::$instance = new self;
         }
 
         return static::$instance;
@@ -61,14 +58,14 @@ final class Container implements ContainerContract, ArrayAccess
        REGISTRATION
        ========================= */
 
-    public function bind(string $abstract, string|Closure $concrete): void
+    public function bind(string $abstract, string|Closure|null $concrete = null): void
     {
-        $this->bindings[$abstract] = $concrete;
+        $this->bindings[$abstract] = $concrete ?? $abstract;
     }
 
-    public function singleton(string $abstract, string|Closure $concrete): void
+    public function singleton(string $abstract, string|Closure|null $concrete = null): void
     {
-        $this->singletons[$abstract] = $concrete;
+        $this->singletons[$abstract] = $concrete ?? $abstract;
     }
 
     public function instance(string $abstract, mixed $instance): void
@@ -81,53 +78,32 @@ final class Container implements ContainerContract, ArrayAccess
         $this->aliases[$alias] = $abstract;
     }
 
-    /**
-     * Assign a set of tags to a given binding.
-     */
     public function tag(array|string $abstracts, array|string $tags): void
     {
-        $tags = (array) $tags;
-
         foreach ((array) $abstracts as $abstract) {
-            foreach ($tags as $tag) {
+            foreach ((array) $tags as $tag) {
                 $this->tags[$tag][] = $abstract;
             }
         }
     }
 
-    /**
-     * Resolve all of the bindings for a given tag.
-     */
     public function tagged(string $tag): iterable
     {
-        if (!isset($this->tags[$tag])) {
-            return [];
-        }
-
-        foreach ($this->tags[$tag] as $abstract) {
-            yield $this->make($abstract);
-        }
+        return isset($this->tags[$tag])
+            ? array_map(fn($abstract) => $this->make($abstract), $this->tags[$tag])
+            : [];
     }
 
-    /**
-     * Define a contextual binding.
-     */
     public function when(string $concrete): ContextualBindingBuilder
     {
         return new ContextualBindingBuilder($this, $concrete);
     }
 
-    /**
-     * Add a contextual binding to the container.
-     */
     public function addContextualBinding(string $concrete, string $abstract, Closure|string $implementation): void
     {
         $this->contextual[$concrete][$abstract] = $implementation;
     }
 
-    /**
-     * "Extend" a service in the container.
-     */
     public function extend(string $abstract, Closure $closure): void
     {
         $abstract = $this->aliases[$abstract] ?? $abstract;
@@ -139,17 +115,11 @@ final class Container implements ContainerContract, ArrayAccess
         }
     }
 
-    /**
-     * Register a new resolving callback.
-     */
     public function resolving(string $abstract, Closure $callback): void
     {
         $this->resolvingCallbacks[$abstract][] = $callback;
     }
 
-    /**
-     * Register a new after resolving callback.
-     */
     public function afterResolving(string $abstract, Closure $callback): void
     {
         $this->afterResolvingCallbacks[$abstract][] = $callback;
@@ -163,10 +133,12 @@ final class Container implements ContainerContract, ArrayAccess
     {
         $abstract = $this->aliases[$abstract] ?? $abstract;
 
+        // Return existing instance
         if (isset($this->instances[$abstract])) {
             return $this->instances[$abstract];
         }
 
+        // Circular dependency protection
         if (in_array($abstract, $this->resolving, true)) {
             throw new CircularDependencyException(
                 "Circular dependency detected: " . implode(' → ', [...$this->resolving, $abstract])
@@ -175,6 +147,7 @@ final class Container implements ContainerContract, ArrayAccess
 
         $this->resolving[] = $abstract;
 
+        // Fire resolving callbacks
         foreach ($this->resolvingCallbacks[$abstract] ?? [] as $callback) {
             $callback($this);
         }
@@ -185,14 +158,17 @@ final class Container implements ContainerContract, ArrayAccess
 
         $object = $this->build($concrete, $parameters);
 
+        // Apply extenders
         foreach ($this->extenders[$abstract] ?? [] as $extender) {
             $object = $extender($object, $this);
         }
 
+        // Fire after resolving callbacks
         foreach ($this->afterResolvingCallbacks[$abstract] ?? [] as $callback) {
             $callback($object, $this);
         }
 
+        // Cache singleton
         if (isset($this->singletons[$abstract])) {
             $this->instances[$abstract] = $object;
         }
@@ -202,14 +178,14 @@ final class Container implements ContainerContract, ArrayAccess
         return $object;
     }
 
-    protected function build(string|Closure $concrete, array $parameters): mixed
+    protected function build(string|Closure $concrete, array $parameters = []): mixed
     {
         if ($concrete instanceof Closure) {
             return $concrete($this, $parameters);
         }
 
         if (!class_exists($concrete)) {
-            throw new BindingResolutionException("Target [$concrete] does not exist.");
+            throw new BindingResolutionException("Target class [$concrete] does not exist.");
         }
 
         $reflector = $this->reflectionCache[$concrete] ??= new ReflectionClass($concrete);
@@ -224,42 +200,51 @@ final class Container implements ContainerContract, ArrayAccess
             return new $concrete;
         }
 
-        $dependencies = array_map(
-            fn(ReflectionParameter $param) =>
-            $this->resolveParameter($param, $parameters),
-            $constructor->getParameters()
-        );
+        $dependencies = $this->resolveDependencies($constructor->getParameters(), $parameters);
 
         return $reflector->newInstanceArgs($dependencies);
     }
 
-    protected function resolveParameter(
-        ReflectionParameter $parameter,
-        array $parameters
-    ): mixed {
+    protected function resolveDependencies(array $parameters, array $primitives = []): array
+    {
+        $dependencies = [];
+
+        foreach ($parameters as $parameter) {
+            $dependencies[] = $this->resolveParameter($parameter, $primitives);
+        }
+
+        return $dependencies;
+    }
+
+    protected function resolveParameter(ReflectionParameter $parameter, array $primitives): mixed
+    {
         $name = $parameter->getName();
 
-        // 1. Check if it's explicitly passed in parameters
-        if (array_key_exists($name, $parameters)) {
-            return $parameters[$name];
+        // 1. Explicit primitive value passed
+        if (array_key_exists($name, $primitives)) {
+            return $primitives[$name];
         }
 
-        // 2. Check for contextual binding
-        $class = $parameter->getDeclaringClass();
-        if ($class && isset($this->contextual[$class->getName()][$name])) {
-            $concrete = $this->contextual[$class->getName()][$name];
-            return $concrete instanceof Closure ? $concrete($this) : $this->make($concrete);
+        $declaringClass = $parameter->getDeclaringClass()?->getName();
+
+        // 2. Contextual binding (by name or type)
+        if ($declaringClass && isset($this->contextual[$declaringClass])) {
+            $context = $this->contextual[$declaringClass];
+
+            if (isset($context[$name])) {
+                $concrete = $context[$name];
+                return $concrete instanceof Closure ? $concrete($this) : $this->make($concrete);
+            }
+
+            $type = $parameter->getType();
+            if ($type instanceof \ReflectionNamedType && !$type->isBuiltin() && isset($context[$type->getName()])) {
+                $concrete = $context[$type->getName()];
+                return $concrete instanceof Closure ? $concrete($this) : $this->make($concrete);
+            }
         }
 
+        // 3. Type-hinted dependency
         $type = $parameter->getType();
-
-        // 3. Check for contextual binding by type
-        if ($type instanceof \ReflectionNamedType && !$type->isBuiltin() && $class && isset($this->contextual[$class->getName()][$type->getName()])) {
-            $concrete = $this->contextual[$class->getName()][$type->getName()];
-            return $concrete instanceof Closure ? $concrete($this) : $this->make($concrete);
-        }
-
-        // 4. Resolve by type-hint
         if ($type instanceof \ReflectionNamedType && !$type->isBuiltin()) {
             try {
                 return $this->make($type->getName());
@@ -274,89 +259,91 @@ final class Container implements ContainerContract, ArrayAccess
             }
         }
 
-        // 5. Handle Variadic
+        // 4. Variadic parameter
         if ($parameter->isVariadic()) {
             return [];
         }
 
-        // 6. Use default value if available
+        // 5. Default value
         if ($parameter->isDefaultValueAvailable()) {
             return $parameter->getDefaultValue();
         }
 
         throw new BindingResolutionException(
-            "Unable to resolve parameter [$name] in " . ($class ? $class->getName() : 'closure')
+            "Unable to resolve parameter [{$name}] in class " . ($declaringClass ?? 'closure')
         );
     }
 
     /* =========================
-       CALLABLE INJECTION
+       METHOD CALLING
        ========================= */
 
-    /**
-     * Call the given Closure / class@method and inject its dependencies.
-     */
-    public function call(callable|string $callable, array $parameters = []): mixed
+    public function call(callable|string $callback, array $parameters = []): mixed
     {
-        if (is_string($callable) && str_contains($callable, '@')) {
-            [$class, $method] = explode('@', $callable);
-            $callable = [$this->make($class), $method];
+        if (is_string($callback) && str_contains($callback, '@')) {
+            [$class, $method] = explode('@', $callback, 2);
+            $callback = [$this->make($class), $method];
         }
 
-        $reflection = is_array($callable)
-            ? new ReflectionMethod($callable[0], $callable[1])
-            : new ReflectionFunction($callable);
+        $reflection = is_array($callback)
+            ? new ReflectionMethod($callback[0], $callback[1])
+            : new ReflectionFunction($callback);
 
-        $args = array_map(
-            fn(ReflectionParameter $param) =>
-            $this->resolveParameter($param, $parameters),
-            $reflection->getParameters()
-        );
+        $args = $this->resolveDependencies($reflection->getParameters(), $parameters);
 
-        return $callable(...$args);
+        return $callback(...$args);
     }
 
-    /**
-     * Wrap the given closure such that its dependencies will be injected when executed.
-     */
     public function wrap(Closure $callback, array $parameters = []): Closure
     {
         return fn() => $this->call($callback, $parameters);
     }
 
-    /**
-     * Get a closure to resolve the given type from the container.
-     */
     public function factory(string $abstract): Closure
     {
         return fn() => $this->make($abstract);
     }
 
     /* =========================
-       CLEANUP
+       INTROSPECTION & CLEANUP
        ========================= */
 
-    /**
-     * Remove a specific instance from the container.
-     */
+    public function has(string $abstract): bool
+    {
+        $abstract = $this->aliases[$abstract] ?? $abstract;
+        return isset($this->bindings[$abstract])
+            || isset($this->singletons[$abstract])
+            || isset($this->instances[$abstract]);
+    }
+
+    public function get(string $abstract): mixed
+    {
+        return $this->make($abstract);
+    }
+
+    public function resolved(string $abstract): bool
+    {
+        $abstract = $this->aliases[$abstract] ?? $abstract;
+        return isset($this->instances[$abstract]);
+    }
+
     public function forgetInstance(string $abstract): void
     {
         unset($this->instances[$abstract]);
     }
 
-    /**
-     * Flush the container of all bindings and resolved instances.
-     */
     public function flush(): void
     {
-        $this->bindings        = [];
-        $this->singletons      = [];
-        $this->instances       = [];
-        $this->aliases         = [];
-        $this->tags            = [];
-        $this->contextual      = [];
-        $this->extenders       = [];
+        $this->bindings = [];
+        $this->singletons = [];
+        $this->instances = [];
+        $this->aliases = [];
+        $this->tags = [];
+        $this->contextual = [];
+        $this->extenders = [];
         $this->reflectionCache = [];
+        $this->resolvingCallbacks = [];
+        $this->afterResolvingCallbacks = [];
     }
 
     /* =========================
@@ -385,21 +372,5 @@ final class Container implements ContainerContract, ArrayAccess
             $this->singletons[$offset],
             $this->instances[$offset]
         );
-    }
-
-    /* =========================
-       INTROSPECTION
-       ========================= */
-
-    public function has(string $abstract): bool
-    {
-        return isset($this->bindings[$abstract])
-            || isset($this->singletons[$abstract])
-            || isset($this->instances[$abstract]);
-    }
-
-    public function resolved(string $abstract): bool
-    {
-        return isset($this->instances[$abstract]);
     }
 }

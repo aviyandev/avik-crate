@@ -8,65 +8,25 @@ use Closure;
 
 final class ContextualBindingBuilder
 {
-    /**
-     * The container instance.
-     *
-     * @var Container
-     */
-    protected Container $container;
+    public function __construct(
+        protected Container $container,
+        protected string $concrete
+    ) {}
 
-    /**
-     * The concrete class that is being configured.
-     *
-     * @var string
-     */
-    protected string $concrete;
-
-    /**
-     * The abstract dependency that is being configured.
-     *
-     * @var string
-     */
-    protected string $needs;
-
-    /**
-     * Create a new contextual binding builder instance.
-     *
-     * @param  Container  $container
-     * @param  string  $concrete
-     * @return void
-     */
-    public function __construct(Container $container, string $concrete)
-    {
-        $this->container = $container;
-        $this->concrete = $concrete;
-    }
-
-    /**
-     * Define the abstract target that depends on the context.
-     *
-     * @param  string  $abstract
-     * @return $this
-     */
     public function needs(string $abstract): self
     {
-        $this->needs = $abstract;
-
+        $this->needs = $abstract;   // Note: $this->needs is used dynamically
         return $this;
     }
 
-    /**
-     * Define the implementation for the contextual binding.
-     *
-     * @param  Closure|string  $implementation
-     * @return void
-     */
     public function give(Closure|string $implementation): void
     {
         $this->container->addContextualBinding(
             $this->concrete,
-            $this->needs,
+            $this->needs ?? throw new \LogicException('You must call needs() before give()'),
             $implementation
         );
     }
+
+    private string $needs; // Dynamic property for fluent API
 }
